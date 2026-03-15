@@ -7,7 +7,7 @@ set -e
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_NAME="parquet-explorer"
-PORT="${PORT:-8501}"
+PORT="${PORT:-8505}"
 
 echo "============================================"
 echo "  Parquet Explorer - Setup & Launch"
