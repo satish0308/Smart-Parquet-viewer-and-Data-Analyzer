@@ -10,6 +10,7 @@ import json
 import tempfile
 import re
 import time
+import hashlib
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -118,9 +119,148 @@ st.markdown("""
         border-radius: 10px;
         padding: 10px 15px;
     }
+    .debug-info {
+        background-color: #e8f4fd;
+        border-left: 4px solid #1f77b4;
+        padding: 10px;
+        margin: 10px 0;
+        font-family: monospace;
+        font-size: 0.9em;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# Add JavaScript to catch and log network errors
+st.markdown("""
+<script>
+window.addEventListener('error', function(e) {
+    // Log all errors to console for debugging
+    console.log('Global error caught:', e);
+});
+</script>
+""", unsafe_allow_html=True)
+
+
+def get_session_storage_path():
+    """Get the path where session data is stored."""
+    storage_dir = os.path.join(os.path.dirname(__file__), ".session_storage")
+    if not os.path.exists(storage_dir):
+        os.makedirs(storage_dir)
+    return storage_dir
+
+def get_session_id():
+    """Generate a session ID based on browser session or user."""
+    # For now, we'll use a fixed ID to persist across refreshes
+    # In production, you might want to use st.runtime.scriptrunner.get_script_run_ctx()
+    return "persistent_session"
+
+def save_session_data():
+    """Save session data to disk."""
+    try:
+        session_id = get_session_id()
+        storage_path = get_session_storage_path()
+
+        # Data that can be serialized
+        serializable_data = {
+            "metadata": st.session_state.metadata,
+            "file_path": st.session_state.file_path,
+            "query_history": st.session_state.query_history,
+            "browse_path": st.session_state.browse_path,
+            "file_loaded": st.session_state.file_loaded,
+            "anthropic_api_key": st.session_state.anthropic_api_key,
+            "ai_chat_history": st.session_state.ai_chat_history,
+            "ai_generated_sql": st.session_state.ai_generated_sql,
+            "dev_mode": st.session_state.dev_mode,
+            "last_error": st.session_state.last_error,
+        }
+
+        # Save serializable data as JSON
+        session_file = os.path.join(storage_path, f"session_{session_id}.json")
+        with open(session_file, 'w') as f:
+            json.dump(serializable_data, f, default=str)
+
+        # Save DataFrame separately if it exists
+        if st.session_state.df is not None:
+            df_file = os.path.join(storage_path, f"df_{session_id}.parquet")
+            st.session_state.df.to_parquet(df_file)
+
+        # Save temp tables separately
+        if st.session_state.temp_tables:
+            for name, df in st.session_state.temp_tables.items():
+                if df is not None:
+                    table_file = os.path.join(storage_path, f"table_{session_id}_{name}.parquet")
+                    df.to_parquet(table_file)
+
+    except Exception as e:
+        if st.session_state.dev_mode:
+            st.warning(f"Could not save session data: {e}")
+
+def load_session_data():
+    """Load session data from disk."""
+    try:
+        session_id = get_session_id()
+        storage_path = get_session_storage_path()
+
+        # Load serializable data
+        session_file = os.path.join(storage_path, f"session_{session_id}.json")
+        if os.path.exists(session_file):
+            with open(session_file, 'r') as f:
+                serializable_data = json.load(f)
+
+            # Restore session state
+            for key, value in serializable_data.items():
+                st.session_state[key] = value
+
+        # Load DataFrame if it exists
+        df_file = os.path.join(storage_path, f"df_{session_id}.parquet")
+        if os.path.exists(df_file):
+            try:
+                st.session_state.df = pd.read_parquet(df_file)
+            except Exception as e:
+                if st.session_state.dev_mode:
+                    st.warning(f"Could not load DataFrame: {e}")
+
+        # Load temp tables if they exist
+        st.session_state.temp_tables = {}
+        for file in os.listdir(storage_path):
+            if file.startswith(f"table_{session_id}_") and file.endswith(".parquet"):
+                table_name = file[len(f"table_{session_id}_"):-len(".parquet")]
+                table_file = os.path.join(storage_path, file)
+                try:
+                    st.session_state.temp_tables[table_name] = pd.read_parquet(table_file)
+                except Exception as e:
+                    if st.session_state.dev_mode:
+                        st.warning(f"Could not load temp table {table_name}: {e}")
+
+    except Exception as e:
+        if st.session_state.dev_mode:
+            st.warning(f"Could not load session data: {e}")
+
+def clear_session_storage():
+    """Clear all saved session data."""
+    try:
+        session_id = get_session_id()
+        storage_path = get_session_storage_path()
+
+        # Remove session file
+        session_file = os.path.join(storage_path, f"session_{session_id}.json")
+        if os.path.exists(session_file):
+            os.remove(session_file)
+
+        # Remove DataFrame file
+        df_file = os.path.join(storage_path, f"df_{session_id}.parquet")
+        if os.path.exists(df_file):
+            os.remove(df_file)
+
+        # Remove temp table files
+        for file in os.listdir(storage_path):
+            if file.startswith(f"table_{session_id}_") and file.endswith(".parquet"):
+                table_file = os.path.join(storage_path, file)
+                os.remove(table_file)
+
+        st.success("Session data cleared successfully!")
+    except Exception as e:
+        st.error(f"Could not clear session data: {e}")
 
 # --- Session State ---
 def init_session():
@@ -139,6 +279,7 @@ def init_session():
         "ai_generated_sql": "",  # last SQL from AI, pending review
         "dev_mode": False,
         "perf_history": deque(maxlen=20),  # last N run logs
+        "last_error": None,  # Track the last error for debugging
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -146,6 +287,8 @@ def init_session():
 
 
 init_session()
+# Load persisted session data
+load_session_data()
 
 
 # --- Helper Functions ---
@@ -179,55 +322,78 @@ def _get_memory_usage_cached(file_path):
 
 
 @st.cache_data(show_spinner="Reading parquet file...")
-def _read_parquet_to_df(file_path):
-    """Cached: read parquet file into pandas DataFrame."""
-    pf = pq.ParquetFile(file_path)
-    df = pf.read().to_pandas()
-    return df
+def _read_parquet_to_df(file_path, max_rows=None):
+    """Cached: read parquet file into pandas DataFrame with optional row limit."""
+    try:
+        pf = pq.ParquetFile(file_path)
+    except Exception as e:
+        raise Exception(f"Failed to create ParquetFile object: {str(e)}")
+
+    try:
+        # For very large files, only load a sample if max_rows is specified
+        if max_rows is not None and pf.metadata.num_rows > max_rows:
+            # Load only a sample of rows
+            df = pf.read(use_pandas_metadata=True).to_pandas()
+            # If we have more rows than max_rows, sample the data
+            if len(df) > max_rows:
+                df = df.sample(n=max_rows).reset_index(drop=True)
+        else:
+            # Load full dataset for smaller files
+            df = pf.read().to_pandas()
+        return df
+    except Exception as e:
+        raise Exception(f"Failed to read data from parquet file: {str(e)}")
 
 
 @st.cache_data(show_spinner=False)
 def _extract_metadata(file_path):
     """Cached: extract parquet metadata (schema, row groups, etc.)."""
-    pf = pq.ParquetFile(file_path)
-    metadata = {
-        "num_rows": pf.metadata.num_rows,
-        "num_columns": pf.metadata.num_columns,
-        "num_row_groups": pf.metadata.num_row_groups,
-        "format_version": pf.metadata.format_version,
-        "created_by": pf.metadata.created_by,
-        "serialized_size": pf.metadata.serialized_size,
-        "schema": pf.schema_arrow,
-        "row_groups": [],
-    }
+    try:
+        pf = pq.ParquetFile(file_path)
+    except Exception as e:
+        raise Exception(f"Failed to create ParquetFile object for metadata: {str(e)}")
 
-    for i in range(pf.metadata.num_row_groups):
-        rg = pf.metadata.row_group(i)
-        rg_info = {
-            "num_rows": rg.num_rows,
-            "total_byte_size": rg.total_byte_size,
-            "columns": [],
+    try:
+        metadata = {
+            "num_rows": pf.metadata.num_rows,
+            "num_columns": pf.metadata.num_columns,
+            "num_row_groups": pf.metadata.num_row_groups,
+            "format_version": pf.metadata.format_version,
+            "created_by": pf.metadata.created_by,
+            "serialized_size": pf.metadata.serialized_size,
+            "schema": pf.schema_arrow,
+            "row_groups": [],
         }
-        for j in range(rg.num_columns):
-            col = rg.column(j)
-            col_info = {
-                "name": col.path_in_schema,
-                "compression": str(col.compression),
-                "encodings": str(col.encodings),
-                "total_compressed_size": col.total_compressed_size,
-                "total_uncompressed_size": col.total_uncompressed_size,
-                "physical_type": str(col.physical_type),
-            }
-            if col.is_stats_set:
-                col_info["min"] = str(col.statistics.min)
-                col_info["max"] = str(col.statistics.max)
-                col_info["null_count"] = col.statistics.null_count
-                col_info["num_values"] = col.statistics.num_values
-                col_info["distinct_count"] = col.statistics.distinct_count
-            rg_info["columns"].append(col_info)
-        metadata["row_groups"].append(rg_info)
 
-    return metadata
+        for i in range(pf.metadata.num_row_groups):
+            rg = pf.metadata.row_group(i)
+            rg_info = {
+                "num_rows": rg.num_rows,
+                "total_byte_size": rg.total_byte_size,
+                "columns": [],
+            }
+            for j in range(rg.num_columns):
+                col = rg.column(j)
+                col_info = {
+                    "name": col.path_in_schema,
+                    "compression": str(col.compression),
+                    "encodings": str(col.encodings),
+                    "total_compressed_size": col.total_compressed_size,
+                    "total_uncompressed_size": col.total_uncompressed_size,
+                    "physical_type": str(col.physical_type),
+                }
+                if col.is_stats_set:
+                    col_info["min"] = str(col.statistics.min)
+                    col_info["max"] = str(col.statistics.max)
+                    col_info["null_count"] = col.statistics.null_count
+                    col_info["num_values"] = col.statistics.num_values
+                    col_info["distinct_count"] = col.statistics.distinct_count
+                rg_info["columns"].append(col_info)
+            metadata["row_groups"].append(rg_info)
+
+        return metadata
+    except Exception as e:
+        raise Exception(f"Failed to extract metadata: {str(e)}")
 
 
 def _build_column_summary(df):
@@ -254,6 +420,18 @@ def _build_column_summary(df):
 
 def _compute_null_counts(df):
     """Compute null counts per column from already-loaded DataFrame."""
+    null_counts = df.isnull().sum()
+    result = pd.DataFrame({
+        "Column": null_counts.index,
+        "Nulls": null_counts.values,
+        "Percentage": (null_counts.values / len(df) * 100).round(2),
+    })
+    return result[result["Nulls"] > 0].sort_values("Nulls", ascending=False)
+
+
+@st.cache_data(show_spinner=False)
+def _compute_null_counts_cached(_df_hash, df):
+    """Cached: compute null counts per column."""
     null_counts = df.isnull().sum()
     result = pd.DataFrame({
         "Column": null_counts.index,
@@ -315,6 +493,59 @@ def _sync_temp_tables_to_duckdb(conn):
             conn.register(tname, tdf)
         except Exception:
             pass
+
+
+def diagnose_file_loading_issues(file_path):
+    """Diagnose common issues that might cause file loading failures."""
+    issues = []
+
+    # Check if file exists
+    if not os.path.exists(file_path):
+        issues.append("File does not exist at the specified path")
+        return issues
+
+    # Check if it's actually a file
+    if not os.path.isfile(file_path):
+        issues.append("Path exists but is not a file (might be a directory)")
+
+    # Check file size
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            issues.append("File is empty (0 bytes)")
+        elif file_size > 1024 * 1024 * 1024:  # 1GB
+            issues.append(f"File is very large ({file_size / (1024*1024*1024):.1f} GB) which might cause memory issues")
+    except Exception as e:
+        issues.append(f"Cannot determine file size: {str(e)}")
+
+    # Check file permissions
+    try:
+        # Check if file is readable
+        with open(file_path, 'rb') as f:
+            pass
+    except PermissionError:
+        issues.append("Permission denied: Cannot read file")
+    except Exception as e:
+        issues.append(f"Cannot open file: {str(e)}")
+
+    # Check if it's a valid parquet file
+    try:
+        pf = pq.ParquetFile(file_path)
+        # Try to read a small portion
+        pf.read_row_group(0) if pf.metadata.num_row_groups > 0 else pf.read()
+    except Exception as e:
+        issues.append(f"File is not a valid parquet file or is corrupted: {str(e)}")
+
+    return issues
+
+
+def _is_table_registered(conn, table_name):
+    """Check if a table is already registered in DuckDB."""
+    try:
+        result = conn.execute(f"SELECT COUNT(*) FROM {table_name} LIMIT 1").fetchone()
+        return True
+    except Exception:
+        return False
 
 
 def _build_schema_context(main_df, temp_tables):
@@ -388,6 +619,45 @@ def _extract_sql_from_response(text):
     if match:
         return match.group(1).strip()
     return None
+
+
+def _apply_filters_in_duckdb(conn, base_table, filter_conditions):
+    """
+    Apply filters using DuckDB instead of Pandas for better performance.
+    filter_conditions should be a dict with column names as keys and filter criteria as values.
+    """
+    query_parts = [f"SELECT * FROM {base_table}"]
+    where_clauses = []
+
+    for col, condition in filter_conditions.items():
+        if condition['type'] == 'range':
+            where_clauses.append(f'"{col}" BETWEEN {condition["min"]} AND {condition["max"]}')
+        elif condition['type'] == 'values':
+            # Escape single quotes in values
+            escaped_values = [str(v).replace("'", "''") for v in condition["values"]]
+            values_list = "', '".join(escaped_values)
+            where_clauses.append(f'"{col}" IN (\'{values_list}\')')
+        elif condition['type'] == 'text':
+            # Escape single quotes in search term
+            escaped_text = condition["text"].replace("'", "''")
+            where_clauses.append(f'CAST("{col}" AS VARCHAR) ILIKE \'%{escaped_text}%\'')
+
+    if where_clauses:
+        query_parts.append("WHERE " + " AND ".join(where_clauses))
+
+    query = " ".join(query_parts)
+    return conn.execute(query).fetchdf()
+
+
+@st.cache_data(show_spinner=False)
+def _cacheable_plotly_chart(fig_dict, chart_type):
+    """
+    Cacheable version of Plotly charts.
+    fig_dict should be a dictionary representation of the figure.
+    """
+    # This is a placeholder - in practice, you might serialize the figure
+    # and cache it, or cache the data and regenerate the chart from it
+    pass
 
 
 def _render_ai_sql_assistant(widget_prefix, target_key):
@@ -495,30 +765,91 @@ def load_parquet(source, is_upload=False):
             else:
                 file_path = source
 
+            # Check if file exists
+            if not os.path.exists(file_path):
+                error_msg = f"File not found: {file_path}"
+                st.session_state.last_error = error_msg
+                return False, error_msg
+
+            # Run diagnostics
+            if st.session_state.dev_mode:
+                issues = diagnose_file_loading_issues(file_path)
+                if issues:
+                    st.warning("Diagnostic issues found:")
+                    for issue in issues:
+                        st.markdown(f"- {issue}")
+
+            # Check file size for user feedback
+            try:
+                file_size = os.path.getsize(file_path)
+                file_size_mb = file_size / (1024 * 1024)
+            except Exception as e:
+                error_msg = f"Cannot access file size: {str(e)}"
+                st.session_state.last_error = error_msg
+                return False, error_msg
+
             with perf.track("read_parquet_to_df"):
-                df = _read_parquet_to_df(file_path)
+                # For large files, limit to 100k rows initially
+                if file_size_mb > 100:  # If file is larger than 100MB
+                    st.info(f"Large file detected ({file_size_mb:.1f} MB). Loading a sample of data for faster preview...")
+
+                try:
+                    df = _read_parquet_to_df(file_path, max_rows=100000)
+                except Exception as e:
+                    error_msg = f"Failed to read parquet file: {str(e)}"
+                    st.session_state.last_error = error_msg
+                    return False, error_msg
+
             perf.log(f"  loaded {len(df):,} rows x {len(df.columns)} cols")
 
             with perf.track("extract_metadata"):
-                metadata = _extract_metadata(file_path)
+                try:
+                    metadata = _extract_metadata(file_path)
+                except Exception as e:
+                    error_msg = f"Failed to extract metadata: {str(e)}"
+                    st.session_state.last_error = error_msg
+                    return False, error_msg
 
             st.session_state.df = df
             st.session_state.metadata = metadata
             st.session_state.file_path = file_path
 
             with perf.track("open_parquet_file"):
-                pf = pq.ParquetFile(file_path)
+                try:
+                    pf = pq.ParquetFile(file_path)
+                except Exception as e:
+                    error_msg = f"Failed to open parquet file with PyArrow: {str(e)}"
+                    st.session_state.last_error = error_msg
+                    return False, error_msg
             st.session_state.parquet_file = pf
 
             with perf.track("register_duckdb"):
-                conn = duckdb.connect()
-                conn.register("parquet_data", df)
-                _sync_temp_tables_to_duckdb(conn)
-                st.session_state.duckdb_conn = conn
+                try:
+                    conn = duckdb.connect()
+                    # Only register if not already registered
+                    if not _is_table_registered(conn, "parquet_data"):
+                        conn.register("parquet_data", df)
+                    _sync_temp_tables_to_duckdb(conn)
+                    st.session_state.duckdb_conn = conn
+                except Exception as e:
+                    error_msg = f"Failed to register with DuckDB: {str(e)}"
+                    st.session_state.last_error = error_msg
+                    return False, error_msg
 
-        return True, "File loaded successfully!"
+        success_msg = f"File loaded successfully! Showing {len(df):,} rows."
+        st.session_state.last_error = None
+
+        # Save session data after successful load
+        if st.session_state.dev_mode:
+            save_session_data()
+
+        return True, success_msg
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        import traceback
+        tb = traceback.format_exc()
+        error_msg = f"Unexpected error: {str(e)}\n\nTraceback:\n{tb}"
+        st.session_state.last_error = error_msg
+        return False, error_msg
 
 
 # --- Sidebar ---
@@ -543,17 +874,40 @@ with st.sidebar:
     elif load_method == "File Path":
         file_path = st.text_input("Enter file path", placeholder="/path/to/file.parquet")
         if file_path and st.button("Load File", type="primary", use_container_width=True):
+            # Additional debugging info
+            st.caption(f"Attempting to load: {file_path}")
+            st.caption(f"File exists: {os.path.exists(file_path)}")
             if os.path.exists(file_path):
-                with st.spinner("Loading..."):
-                    ok, msg = load_parquet(file_path)
-                if ok:
-                    st.success(msg)
-                    st.session_state.file_loaded = True
-                    st.rerun()
+                # Check if it's actually a file (not a directory)
+                if os.path.isfile(file_path):
+                    st.caption(f"Is file: True")
+                    st.caption(f"File size: {os.path.getsize(file_path)} bytes")
+                    try:
+                        st.caption(f"File permissions: {oct(os.stat(file_path).st_mode)[-3:]}")
+                    except Exception as e:
+                        st.caption(f"Could not get permissions: {e}")
+
+                    with st.spinner("Loading..."):
+                        ok, msg = load_parquet(file_path)
+                    if ok:
+                        st.success(msg)
+                        st.session_state.file_loaded = True
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                        # Add detailed error info in dev mode
+                        if st.session_state.dev_mode:
+                            st.code(msg, language="text")
                 else:
-                    st.error(msg)
+                    st.error("Path exists but is not a file (might be a directory)!")
             else:
                 st.error("File not found!")
+                # Check if parent directory exists
+                parent_dir = os.path.dirname(file_path)
+                if parent_dir and os.path.exists(parent_dir):
+                    st.info(f"Parent directory exists: {parent_dir}")
+                else:
+                    st.info(f"Parent directory does not exist: {parent_dir}")
 
     elif load_method == "Browse Folders":
         # Interactive folder browser
@@ -607,6 +961,12 @@ with st.sidebar:
                 selected_file = st.selectbox("Select file", pq_files, key="pq_file_select")
                 if st.button("Load Selected File", type="primary", use_container_width=True):
                     full_path = os.path.join(current_path, selected_file)
+                    # Debug info
+                    st.caption(f"Attempting to load: {full_path}")
+                    st.caption(f"File exists: {os.path.exists(full_path)}")
+                    if os.path.exists(full_path):
+                        st.caption(f"Is file: {os.path.isfile(full_path)}")
+
                     with st.spinner("Loading..."):
                         ok, msg = load_parquet(full_path)
                     if ok:
@@ -615,13 +975,20 @@ with st.sidebar:
                         st.rerun()
                     else:
                         st.error(msg)
+                        # Add detailed error info in dev mode
+                        if st.session_state.dev_mode:
+                            st.code(msg, language="text")
             else:
                 st.info("No .parquet files in this folder.")
 
             # Recursive search option
             if st.checkbox("Search subfolders"):
                 with st.spinner("Scanning..."):
-                    found = sorted(Path(current_path).rglob("*.parquet"))
+                    try:
+                        found = sorted(Path(current_path).rglob("*.parquet"))
+                    except Exception as e:
+                        st.error(f"Error scanning subfolders: {str(e)}")
+                        found = []
                 if found:
                     st.markdown(f"**Found {len(found)} files:**")
                     selected_recursive = st.selectbox(
@@ -631,14 +998,21 @@ with st.sidebar:
                         key="recursive_pq_select",
                     )
                     if st.button("Load File", type="primary", use_container_width=True, key="load_recursive"):
+                        full_path = str(selected_recursive)
+                        st.caption(f"Attempting to load: {full_path}")
+                        st.caption(f"File exists: {os.path.exists(full_path)}")
+
                         with st.spinner("Loading..."):
-                            ok, msg = load_parquet(str(selected_recursive))
+                            ok, msg = load_parquet(full_path)
                         if ok:
                             st.success(msg)
                             st.session_state.file_loaded = True
                             st.rerun()
                         else:
                             st.error(msg)
+                            # Add detailed error info in dev mode
+                            if st.session_state.dev_mode:
+                                st.code(msg, language="text")
                 else:
                     st.warning("No .parquet files in subfolders.")
         else:
@@ -665,10 +1039,87 @@ with st.sidebar:
         "Developer Mode", value=st.session_state.get("dev_mode", False), key="dev_mode_toggle"
     )
 
+    # Session persistence controls (only in dev mode)
+    if st.session_state.dev_mode:
+        st.markdown("---")
+        st.markdown("### Session Persistence")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save Session"):
+                save_session_data()
+                st.success("Session saved!")
+        with col2:
+            if st.button("Clear Saved Session"):
+                clear_session_storage()
+                st.session_state.clear()
+                init_session()
+                st.success("Session cleared!")
+                st.rerun()
+
 # --- Main Content ---
 if st.session_state.df is None:
     st.markdown("## Welcome to Parquet Explorer")
     st.markdown("Load a parquet file using the sidebar to get started.")
+
+    # Display debugging info if dev mode is enabled
+    if st.session_state.dev_mode:
+        st.markdown("### Debugging Info")
+        st.markdown(f"**Current Working Directory:** `{os.getcwd()}`")
+        st.markdown(f"**User Home Directory:** `{os.path.expanduser('~')}`")
+        st.markdown(f"**File Path in Session State:** `{st.session_state.file_path if st.session_state.file_path else 'None'}`")
+
+        # Show last error if any
+        if st.session_state.last_error:
+            st.markdown("### Last Error")
+            st.error(st.session_state.last_error)
+
+        # Note about checking for network errors
+        st.markdown("### Network Error Detection")
+        st.markdown("If you see network-related errors (like AxiosError) in your browser console:")
+        st.markdown("1. Check the browser's developer tools (F12) -> Console tab for more details")
+        st.markdown("2. Verify that all required ports are accessible")
+        st.markdown("3. Check if there are any CORS issues")
+        st.markdown("4. Ensure the server is running and accessible")
+
+        # Check for any parquet files in common locations
+        st.markdown("**Looking for parquet files in common locations:**")
+
+        # Look for parquet files in common locations
+        common_dirs = [
+            os.getcwd(),
+            os.path.expanduser("~"),
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Documents"),
+        ]
+
+        found_parquet_files = []
+        for directory in common_dirs:
+            if os.path.exists(directory):
+                try:
+                    for file in os.listdir(directory):
+                        if file.endswith(".parquet"):
+                            found_parquet_files.append(os.path.join(directory, file))
+                except PermissionError:
+                    st.markdown(f"- `{directory}`: 🔒 Permission denied")
+                except Exception as e:
+                    st.markdown(f"- `{directory}`: ❌ Error: {str(e)}")
+
+        if found_parquet_files:
+            st.markdown("**Found parquet files:**")
+            for file_path in found_parquet_files[:10]:  # Limit to first 10
+                st.markdown(f"- `{file_path}`")
+
+                # Offer to run diagnostics on the file
+                if st.button(f"Diagnose {os.path.basename(file_path)}", key=f"diag_{hash(file_path)}"):
+                    st.markdown(f"### Diagnostics for {os.path.basename(file_path)}")
+                    issues = diagnose_file_loading_issues(file_path)
+                    if issues:
+                        for issue in issues:
+                            st.markdown(f"- ⚠️ {issue}")
+                    else:
+                        st.markdown("✅ No issues detected with the file")
+        else:
+            st.markdown("_No parquet files found in common locations_")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -775,7 +1226,9 @@ else:
             # Use cached result to avoid recomputing on every rerun
             if "_null_counts_cache" not in st.session_state:
                 with perf.track("overview: null_counts"):
-                    st.session_state["_null_counts_cache"] = _compute_null_counts(df)
+                    # Pass a hash of the dataframe to make it cacheable
+                    df_hash = hash(df.to_string())
+                    st.session_state["_null_counts_cache"] = _compute_null_counts_cached(df_hash, df)
             null_df = st.session_state["_null_counts_cache"]
             if len(null_df) > 0:
                 fig = px.bar(null_df.head(20), x="Column", y="Percentage",
@@ -819,7 +1272,9 @@ else:
         # Filter section
         with st.expander("Filters", expanded=False):
             filter_col = st.selectbox("Filter column", ["None"] + df.columns.tolist(), key="filter_col")
-            filtered_df = df[selected_cols]
+
+            # Prepare filter conditions for DuckDB
+            filter_conditions = {}
 
             if filter_col != "None":
                 col_type = df[filter_col].dtype
@@ -828,30 +1283,79 @@ else:
                     min_val = float(df[filter_col].min())
                     max_val = float(df[filter_col].max())
                     range_vals = st.slider("Range", min_val, max_val, (min_val, max_val), key="num_filter")
-                    filtered_df = filtered_df[
-                        (df[filter_col] >= range_vals[0]) & (df[filter_col] <= range_vals[1])
-                    ]
+                    filter_conditions[filter_col] = {
+                        'type': 'range',
+                        'min': range_vals[0],
+                        'max': range_vals[1]
+                    }
                 elif pd.api.types.is_string_dtype(col_type) or pd.api.types.is_categorical_dtype(col_type):
                     unique_vals = df[filter_col].dropna().unique().tolist()
                     if len(unique_vals) <= 100:
                         selected_vals = st.multiselect("Values", unique_vals, key="cat_filter")
                         if selected_vals:
-                            filtered_df = filtered_df[df[filter_col].isin(selected_vals)]
+                            filter_conditions[filter_col] = {
+                                'type': 'values',
+                                'values': selected_vals
+                            }
                     else:
                         text_filter = st.text_input("Contains", key="text_filter")
                         if text_filter:
-                            filtered_df = filtered_df[
-                                df[filter_col].astype(str).str.contains(text_filter, case=False, na=False)
-                            ]
+                            filter_conditions[filter_col] = {
+                                'type': 'text',
+                                'text': text_filter
+                            }
                 elif pd.api.types.is_datetime64_any_dtype(col_type):
                     min_date = df[filter_col].min()
                     max_date = df[filter_col].max()
                     date_range = st.date_input("Date range", [min_date, max_date], key="date_filter")
                     if len(date_range) == 2:
-                        filtered_df = filtered_df[
-                            (df[filter_col] >= pd.Timestamp(date_range[0])) &
-                            (df[filter_col] <= pd.Timestamp(date_range[1]))
-                        ]
+                        filter_conditions[filter_col] = {
+                            'type': 'range',
+                            'min': f"'{date_range[0]}'",
+                            'max': f"'{date_range[1]}'"
+                        }
+
+            # Apply filters using DuckDB for better performance
+            conn = st.session_state.duckdb_conn
+            if filter_conditions:
+                try:
+                    filtered_df = _apply_filters_in_duckdb(conn, "parquet_data", filter_conditions)
+                    # Select only the columns the user wants to see
+                    if selected_cols and len(selected_cols) > 0:
+                        filtered_df = filtered_df[selected_cols]
+                except Exception as e:
+                    st.error(f"Filter error: {e}")
+                    # Fallback to original filtering method
+                    filtered_df = df[selected_cols]
+
+                    # Apply the filters using the original method as fallback
+                    if filter_col != "None":
+                        col_type = df[filter_col].dtype
+
+                        if pd.api.types.is_numeric_dtype(col_type):
+                            range_vals = st.session_state.get("num_filter")
+                            if range_vals:
+                                filtered_df = filtered_df[
+                                    (df[filter_col] >= range_vals[0]) & (df[filter_col] <= range_vals[1])
+                                ]
+                        elif pd.api.types.is_string_dtype(col_type) or pd.api.types.is_categorical_dtype(col_type):
+                            selected_vals = st.session_state.get("cat_filter")
+                            text_filter = st.session_state.get("text_filter")
+                            if selected_vals:
+                                filtered_df = filtered_df[df[filter_col].isin(selected_vals)]
+                            elif text_filter:
+                                filtered_df = filtered_df[
+                                    df[filter_col].astype(str).str.contains(text_filter, case=False, na=False)
+                                ]
+                        elif pd.api.types.is_datetime64_any_dtype(col_type):
+                            date_range = st.session_state.get("date_filter")
+                            if date_range and len(date_range) == 2:
+                                filtered_df = filtered_df[
+                                    (df[filter_col] >= pd.Timestamp(date_range[0])) &
+                                    (df[filter_col] <= pd.Timestamp(date_range[1]))
+                                ]
+            else:
+                filtered_df = df[selected_cols]
 
             st.info(f"Showing {len(filtered_df):,} rows after filter (from {len(df):,} total)")
 
@@ -996,6 +1500,10 @@ else:
                 st.success(f"Returned {len(result):,} rows in {elapsed:.3f}s")
                 st.dataframe(result, use_container_width=True, hide_index=True, height=500)
 
+                # Save session data after successful query
+                if st.session_state.dev_mode:
+                    save_session_data()
+
                 # Download query results
                 csv_data = result.to_csv(index=False)
                 st.download_button(
@@ -1085,10 +1593,15 @@ else:
                         _sync_temp_tables_to_duckdb(conn)
                         result_df = conn.execute(tt_query).fetchdf()
                         st.session_state.temp_tables[name] = result_df
-                        conn.register(name, result_df)
+                        # Only register if not already registered
+                        if not _is_table_registered(conn, name):
+                            conn.register(name, result_df)
                         st.success(
                             f"Created **{name}** ({len(result_df):,} rows x {len(result_df.columns)} cols)"
                         )
+                        # Save session data after creating temp table
+                        if st.session_state.dev_mode:
+                            save_session_data()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Query error: {e}")
@@ -1133,7 +1646,9 @@ else:
                                 ]
 
                     st.session_state.temp_tables[name] = filt_df
-                    conn.register(name, filt_df)
+                    # Only register if not already registered
+                    if not _is_table_registered(conn, name):
+                        conn.register(name, filt_df)
                     st.success(
                         f"Created **{name}** ({len(filt_df):,} rows x {len(filt_df.columns)} cols)"
                     )
@@ -1211,6 +1726,9 @@ else:
                         st.success(
                             f"Updated **{selected_tt}** ({len(new_df):,} rows x {len(new_df.columns)} cols)"
                         )
+                        # Save session data after modifying temp table
+                        if st.session_state.dev_mode:
+                            save_session_data()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Query error: {e}")
@@ -1235,6 +1753,9 @@ else:
                         except Exception:
                             pass
                         st.success(f"Renamed **{selected_tt}** to **{new_name}**")
+                        # Save session data after renaming temp table
+                        if st.session_state.dev_mode:
+                            save_session_data()
                         st.rerun()
 
             elif inspect_action == "Delete":
@@ -1246,6 +1767,9 @@ else:
                     except Exception:
                         pass
                     st.success(f"Deleted **{selected_tt}**")
+                    # Save session data after deleting temp table
+                    if st.session_state.dev_mode:
+                        save_session_data()
                     st.rerun()
 
             # ---- Quick SQL on temp tables ----
@@ -1647,3 +2171,6 @@ else:
                               markers=True)
                 fig.update_layout(height=250)
                 st.plotly_chart(fig, use_container_width=True)
+
+# Note: Session data is automatically saved on important actions (file load, query execution, etc.)
+# For periodic saving, you would need to implement a background task or use Streamlit's experimental features
