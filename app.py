@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import pyarrow.parquet as pq
+import pyarrow as pa
 import duckdb
 import plotly.express as px
 import plotly.graph_objects as go
@@ -350,21 +351,24 @@ def _extract_metadata(file_path):
     """Cached: extract parquet metadata (schema, row groups, etc.)."""
     try:
         pf = pq.ParquetFile(file_path)
+        print(f"ParquetFile created successfully for {file_path}")
     except Exception as e:
-        raise Exception(f"Failed to create ParquetFile object for metadata: {str(e)}")
+        print(f"Failed to create ParquetFile object for metadata: {str(e)}")
+        return None
 
     try:
         metadata = {
-            "num_rows": pf.metadata.num_rows,
-            "num_columns": pf.metadata.num_columns,
-            "num_row_groups": pf.metadata.num_row_groups,
-            "format_version": pf.metadata.format_version,
-            "created_by": pf.metadata.created_by,
-            "serialized_size": pf.metadata.serialized_size,
-            "schema": pf.schema_arrow,
-            "row_groups": [],
-        }
-
+                "num_rows": pf.metadata.num_rows,
+                "num_columns": pf.metadata.num_columns,
+                "num_row_groups": pf.metadata.num_row_groups,
+                "format_version": pf.metadata.format_version,
+                "created_by": pf.metadata.created_by,
+                "serialized_size": pf.metadata.serialized_size,
+                "schema": [{"name": field.name,
+                            "type": str(field.type),
+                            "nullable": field.nullable}
+                            for field in pf.schema_arrow],
+                "row_groups": [],}
         for i in range(pf.metadata.num_row_groups):
             rg = pf.metadata.row_group(i)
             rg_info = {
@@ -393,9 +397,20 @@ def _extract_metadata(file_path):
 
         return metadata
     except Exception as e:
-        raise Exception(f"Failed to extract metadata: {str(e)}")
+        print(f"Failed to extract metadata: {str(e)}")
+        return None
 
-
+@st.cache_resource(show_spinner=False)
+def _get_parquet_file_handle(file_path):
+    """Cached: Safely get and keep open a ParquetFile handle across reruns."""
+    if not file_path or not os.path.exists(file_path):
+        return None
+    try:
+        return pq.ParquetFile(file_path)
+    except Exception as e:
+        print(f"Failed to create ParquetFile handle: {e}")
+        return None
+        
 def _build_column_summary(df):
     """Build column summary from the already-loaded DataFrame."""
     summary_data = []
@@ -816,12 +831,14 @@ def load_parquet(source, is_upload=False):
 
             with perf.track("open_parquet_file"):
                 try:
-                    pf = pq.ParquetFile(file_path)
+                    pf = _get_parquet_file_handle(file_path)
+                    if pf is None:
+                        raise Exception("Could not create ParquetFile handle.")
                 except Exception as e:
                     error_msg = f"Failed to open parquet file with PyArrow: {str(e)}"
                     st.session_state.last_error = error_msg
                     return False, error_msg
-            st.session_state.parquet_file = pf
+            st.session_state.file_path = file_path
 
             with perf.track("register_duckdb"):
                 try:
@@ -1019,7 +1036,7 @@ with st.sidebar:
             st.error("Invalid directory path.")
 
     st.markdown("---")
-    if st.session_state.df is not None:
+    if st.session_state.df is not None and st.session_state.metadata is not None:
         st.markdown("**Loaded File Info**")
         meta = st.session_state.metadata
         st.markdown(f"- Rows: `{meta['num_rows']:,}`")
@@ -1056,8 +1073,23 @@ with st.sidebar:
                 st.success("Session cleared!")
                 st.rerun()
 
+def dict_to_schema(schema_dict):
+    import pyarrow as pa
+
+    fields = []
+    for col in schema_dict:
+        fields.append(
+            pa.field(
+                col["name"],
+                pa.type_for_alias(col["type"]),
+                nullable=col["nullable"]
+            )
+        )
+    
+    return pa.schema(fields)
+    
 # --- Main Content ---
-if st.session_state.df is None:
+if st.session_state.df is None and st.session_state.metadata is None:
     st.markdown("## Welcome to Parquet Explorer")
     st.markdown("Load a parquet file using the sidebar to get started.")
 
@@ -1156,7 +1188,8 @@ else:
     perf.log("=== Script rerun started ===")
     df = st.session_state.df
     metadata = st.session_state.metadata
-
+    print("satish")
+    print(metadata)
     # --- Always-visible file info and data snapshot ---
     with perf.track("header_metrics"):
         file_display = st.session_state.file_path or "Uploaded file"
@@ -1407,7 +1440,7 @@ else:
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### Arrow Schema")
-            schema = metadata["schema"]
+            schema = schema = dict_to_schema(metadata["schema"])
             schema_data = []
             for i in range(len(schema)):
                 field = schema.field(i)
@@ -1433,8 +1466,17 @@ else:
             for k, v in meta_info.items():
                 st.markdown(f"**{k}:** `{v}`")
 
-            # Key-value metadata
-            pf = st.session_state.parquet_file
+            @st.cache_resource
+            def get_pf(file_path):
+                return pq.ParquetFile(file_path)
+
+            file_path = st.session_state.get("file_path")
+
+            if not file_path:
+                st.warning("Please load a file")
+                st.stop()
+
+            pf = get_pf(file_path)
             if pf.schema_arrow.metadata:
                 st.markdown("#### Custom Metadata")
                 for k, v in pf.schema_arrow.metadata.items():
@@ -1445,6 +1487,7 @@ else:
                             st.json(parsed)
                         except (json.JSONDecodeError, ValueError):
                             st.code(val)
+
 
     # ==================== SQL QUERY ====================
     with tabs[3]:
